@@ -1,0 +1,36 @@
+name: Feature Request
+description: Suggest an idea or enhancement for the VPAT Analyzer.
+title: "[Feature]: "
+labels:
+  - enhancement
+assignees:
+  - ms9513
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest a feature for the VPAT Analyzer.
+  - type: textarea
+    id: problem-description
+    attributes:
+      label: Is your feature request related to a problem? Please describe.
+      description: A clear and concise description of what the problem is.
+      placeholder: Ex. I'm always frustrated when [...]
+    validations:
+      required: false
+  - type: textarea
+    id: solution-description
+    attributes:
+      label: Describe the solution you'd like
+      description: A clear and concise description of what you want to happen.
+      placeholder: Tell us what you'd like to see added or changed.
+    validations:
+      required: true
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add any other context or screenshots about the feature request here.
+      placeholder: Include supporting details, examples, mockups, or screenshots if helpful.
+    validations:
+      required: false
