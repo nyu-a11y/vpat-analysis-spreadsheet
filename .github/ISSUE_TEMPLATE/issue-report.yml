@@ -12,6 +12,11 @@ body:
         Thanks for taking the time to report an issue with the VPAT Analyzer.
 
         Please fill out the sections below with as much detail as you can so we can reproduce and fix the problem faster.
+
+        > **[!WARNING] Do Not Include Sensitive Information**
+        > This issue tracker is **publicly visible**. Do not include any sensitive or confidential information, such as passwords, API keys, or private data.
+        > Email [NYU Digital Accessibility (digital-accessibility@nyu.edu)](mailto:digital-accessibility@nyu.edu) for assistance.
+
   - type: checkboxes
     id: checks
     attributes:
