@@ -357,7 +357,7 @@ function processVPATDocument() {
 
 /**
  * Gets processing configuration from the Start sheet
- * @returns {Object|null} Configuration object with fileId from A3
+ * @returns {Object|null} Configuration object with fileId from the Start input cell
  */
 function getUserInput() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -365,21 +365,22 @@ function getUserInput() {
 
   if (!startSheet) {
     throw new Error(
-      `Sheet "${CONFIG.START_SHEET_NAME}" not found. Please create it with the file ID in cell ${CONFIG.FILE_ID_CELL}.`,
+      `Sheet "${CONFIG.START_SHEET_NAME}" not found. Please create it with a file ID, full Drive URL, or file chip in cell ${CONFIG.FILE_ID_CELL}.`,
     );
   }
 
-  const fileId = startSheet.getRange(CONFIG.FILE_ID_CELL).getValue();
+  const fileIdRange = startSheet.getRange(CONFIG.FILE_ID_CELL);
+  const fileId = resolveDriveFileIdFromRange(fileIdRange);
 
   // Validate file ID
-  if (!fileId || String(fileId).trim() === "") {
+  if (!fileId) {
     throw new Error(
-      `File ID not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}" sheet. Please enter the Google Drive file ID.`,
+      `A valid Google Drive file ID was not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter a raw file ID, full Drive URL, or file chip.`,
     );
   }
 
   // Return file ID with null for row numbers (process all rows)
-  return { fileId: String(fileId).trim(), startRow: null, endRow: null };
+  return { fileId: fileId, startRow: null, endRow: null };
 }
 
 /**
@@ -2199,7 +2200,7 @@ function analyzeQualityChecklist() {
 }
 
 /**
- * Gets VPAT file ID from the Start sheet (cell A3)
+ * Gets VPAT file ID from the Start sheet input cell
  * @returns {string|null} File ID or null if not found
  */
 function getVPATFileIdForAnalysis() {
@@ -2208,19 +2209,20 @@ function getVPATFileIdForAnalysis() {
 
   if (!startSheet) {
     throw new Error(
-      `Sheet "${CONFIG.START_SHEET_NAME}" not found. Please create it with the file ID in cell ${CONFIG.FILE_ID_CELL}.`,
+      `Sheet "${CONFIG.START_SHEET_NAME}" not found. Please create it with a file ID, full Drive URL, or file chip in cell ${CONFIG.FILE_ID_CELL}.`,
     );
   }
 
-  const fileId = startSheet.getRange(CONFIG.FILE_ID_CELL).getValue();
+  const fileIdRange = startSheet.getRange(CONFIG.FILE_ID_CELL);
+  const fileId = resolveDriveFileIdFromRange(fileIdRange);
 
-  if (!fileId || String(fileId).trim() === "") {
+  if (!fileId) {
     throw new Error(
-      `File ID not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}" sheet. Please enter the Google Drive file ID.`,
+      `A valid Google Drive file ID was not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter a raw file ID, full Drive URL, or file chip.`,
     );
   }
 
-  return String(fileId).trim();
+  return fileId;
 }
 
 /**
