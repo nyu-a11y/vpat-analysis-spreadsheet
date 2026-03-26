@@ -375,7 +375,7 @@ function getUserInput() {
   // Validate file ID
   if (!fileId) {
     throw new Error(
-      `A valid Google Drive file ID was not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter a raw file ID, full Drive URL, or file chip.`,
+      `A valid Google Drive file ID was not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter a raw file ID, full Drive URL, or file chip. If a file chip was used, check the Apps Script execution log for chip metadata read errors.`,
     );
   }
 
@@ -392,6 +392,7 @@ function getUserInput() {
 function resolveDriveFileIdFromRange(range) {
   const richText = range.getRichTextValue();
   const candidates = [];
+  let rawIdFallback = "";
 
   if (richText) {
     const linkUrl = richText.getLinkUrl();
@@ -416,6 +417,16 @@ function resolveDriveFileIdFromRange(range) {
 
   for (const candidate of candidates) {
     const fileId = extractDriveFileId(candidate);
+    if (!fileId) {
+      continue;
+    }
+
+    const candidateText = String(candidate || "").trim();
+    if (candidateText === fileId && looksLikeDriveFileId(candidateText)) {
+      rawIdFallback = fileId;
+      continue;
+    }
+
     if (fileId) {
       return fileId;
     }
@@ -426,7 +437,7 @@ function resolveDriveFileIdFromRange(range) {
     return extractDriveFileId(chipUrl);
   }
 
-  return "";
+  return rawIdFallback;
 }
 
 /**
@@ -517,7 +528,7 @@ function getDriveFileChipUrlFromRange(range) {
 
     if (response.getResponseCode() !== 200) {
       Logger.log(
-        `Failed to read chip metadata for ${rangeA1}: ${response.getResponseCode()}`,
+        `Failed to read chip metadata for ${rangeA1}: ${response.getResponseCode()} ${response.getContentText().substring(0, 500)}`,
       );
       return "";
     }
@@ -2293,7 +2304,7 @@ function getVPATFileIdForAnalysis() {
 
   if (!fileId) {
     throw new Error(
-      `A valid Google Drive file ID was not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter a raw file ID, full Drive URL, or file chip.`,
+      `A valid Google Drive file ID was not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter a raw file ID, full Drive URL, or file chip. If a file chip was used, check the Apps Script execution log for chip metadata read errors.`,
     );
   }
 
