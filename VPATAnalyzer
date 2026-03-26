@@ -38,6 +38,7 @@ const CONFIG = {
 
   // Start Sheet Configuration
   START_SHEET_NAME: "1) Start",
+  ASSESSMENT_SHEET_NAME: "2) Assessment Information",
   SCORING_SHEET_NAME: "5) Scoring",
   FILE_ID_CELL: "A3", // Cell containing the Google Drive file ID
   API_KEY_CELL: "B3", // Cell containing the API key for selected provider
@@ -68,6 +69,12 @@ const CONFIG = {
 
   // Document Processing
   EXPECTED_TABLE_COLUMNS: 3, // Criteria, Conformance Level, Remarks
+
+  // Assessment Information Configuration
+  ASSESSMENT_INFO: {
+    EXCLUDED_FIELD_NAMES: ["Status", "Note"],
+    MIN_FUZZY_MATCH_SCORE: 0.75,
+  },
 
   // Quality Checklist Configuration
   QUALITY_CHECKLIST: {
@@ -165,13 +172,14 @@ function runFullProcessingWithQuality() {
  * 3. Enter: runCompleteAnalysis
  */
 /**
- * Unhides all four working sheets so they are visible before any operation runs.
+ * Unhides all five working sheets so they are visible before any operation runs.
  * Safe to call even if a sheet is already visible.
  */
 function unhideAllSheets() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheetNames = [
     CONFIG.START_SHEET_NAME,
+    CONFIG.ASSESSMENT_SHEET_NAME,
     CONFIG.OUTPUT_SHEET_NAME,
     CONFIG.QUALITY_CHECKLIST.SHEET_NAME,
     CONFIG.SCORING_SHEET_NAME,
@@ -270,6 +278,21 @@ function runQualityAnalysis() {
     analyzeQualityChecklist();
   } catch (error) {
     ss.toast(`Error: ${error.message}`, "Quality Analysis Failed", 10);
+  }
+}
+
+/**
+ * Button-friendly: Fill assessment information only
+ * Assign to button with function name: runAssessmentInformation
+ */
+function runAssessmentInformation() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  unhideAllSheets();
+  try {
+    ss.toast("Filling assessment information...", "Processing", -1);
+    processAssessmentInformation();
+  } catch (error) {
+    ss.toast(`Error: ${error.message}`, "Assessment Information Failed", 10);
   }
 }
 
@@ -648,6 +671,485 @@ function isAccessibleDriveFileId(fileId) {
 }
 
 /*******************************************************
+ * ASSESSMENT INFORMATION
+ *******************************************************/
+
+/**
+ * Main entry point for filling the Assessment Information sheet.
+ * Reads label/value pairs from the VPAT and writes matching rows in sheet 2.
+ * Skips Status and Note rows by design.
+ * @param {string} fileIdOverride - Optional Drive file ID to reuse from a caller
+ * @returns {Object} Processing result
+ */
+function processAssessmentInformation(fileIdOverride) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CONFIG.ASSESSMENT_SHEET_NAME);
+  let tempDocId = null;
+
+  if (!sheet) {
+    throw new Error(
+      `Assessment sheet "${CONFIG.ASSESSMENT_SHEET_NAME}" not found. Please create it before running this step.`,
+    );
+  }
+
+  try {
+    const fileId = fileIdOverride || getUserInput().fileId;
+
+    showProgress("Loading VPAT document for assessment information...");
+    const documentData = openDocumentForProcessing(fileId);
+    tempDocId = documentData.tempDocId;
+
+    const body = documentData.doc.getBody();
+    const metadata = extractAssessmentFields(
+      body.getText(),
+      body.getTables(),
+    );
+
+    if (metadata.size === 0) {
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        "No assessment information fields were found in the VPAT document.",
+        "Nothing Processed",
+        10,
+      );
+      return { success: false, reason: "no-metadata" };
+    }
+
+    showProgress("Writing assessment information to sheet...");
+    const results = writeAssessmentInformationToSheet(sheet, metadata);
+
+    if (results.rowsUpdated === 0) {
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        "No assessment information rows were updated. Check the sheet labels and document metadata.",
+        "Nothing Processed",
+        10,
+      );
+      return { success: false, reason: "no-updates", results: results };
+    }
+
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      `✓ Assessment information updated ${results.rowsUpdated} of ${results.totalRows} rows`,
+      "Success",
+      10,
+    );
+    return { success: true, results: results };
+  } catch (error) {
+    Logger.log(`Error in processAssessmentInformation: ${error.message}`);
+    Logger.log(error.stack);
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      `Error: ${error.message}`,
+      "Assessment Information Failed",
+      10,
+    );
+    return { success: false, reason: "error", message: error.message };
+  } finally {
+    cleanup(tempDocId);
+    try {
+      hideProgress();
+    } catch (e) {
+      // Ignore progress cleanup errors
+    }
+  }
+}
+
+/**
+ * Extracts assessment-information label/value pairs from the document text and tables.
+ * @param {string} documentText - Full document text
+ * @param {GoogleAppsScript.Document.Table[]} tables - Tables from the document body
+ * @returns {Map<string, {label: string, value: string}>} Normalized label -> entry
+ */
+function extractAssessmentFields(documentText, tables) {
+  const metadata = new Map();
+
+  collectAssessmentFieldsFromTables(metadata, tables || []);
+  collectAssessmentFieldsFromText(metadata, documentText || "");
+
+  Logger.log(
+    `Extracted ${metadata.size} assessment-information fields from the document.`,
+  );
+  return metadata;
+}
+
+/**
+ * Collects assessment fields from label/value tables.
+ * Handles both 2-column rows and even-numbered label/value pairs across a row.
+ * @param {Map<string, {label: string, value: string}>} metadata - Output map
+ * @param {GoogleAppsScript.Document.Table[]} tables - Document tables
+ */
+function collectAssessmentFieldsFromTables(metadata, tables) {
+  for (const table of tables) {
+    const numRows = table.getNumRows();
+
+    for (let i = 0; i < numRows; i++) {
+      const row = table.getRow(i);
+      const cellTexts = [];
+
+      for (let c = 0; c < row.getNumCells(); c++) {
+        const cellText = getCellText(row.getCell(c));
+        if (cellText) {
+          cellTexts.push(cellText);
+        }
+      }
+
+      if (cellTexts.length < 2) {
+        continue;
+      }
+
+      if (cellTexts.length >= 4 && cellTexts.length % 2 === 0) {
+        for (let c = 0; c < cellTexts.length; c += 2) {
+          upsertAssessmentField(metadata, cellTexts[c], cellTexts[c + 1]);
+        }
+        continue;
+      }
+
+      upsertAssessmentField(
+        metadata,
+        cellTexts[0],
+        cellTexts.slice(1).join(" "),
+      );
+    }
+  }
+}
+
+/**
+ * Collects assessment fields from colon-delimited lines in the document text.
+ * Supports both inline values and values that continue on following lines.
+ * @param {Map<string, {label: string, value: string}>} metadata - Output map
+ * @param {string} documentText - Full document text
+ */
+function collectAssessmentFieldsFromText(metadata, documentText) {
+  const lines = String(documentText || "").split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = String(lines[i] || "").trim();
+    if (!line) {
+      continue;
+    }
+
+    const labelOnlyMatch = line.match(/^([^:]{2,80}):\s*$/);
+    if (labelOnlyMatch) {
+      const valueLines = [];
+      let j = i + 1;
+
+      for (; j < lines.length; j++) {
+        const nextLine = String(lines[j] || "").trim();
+        if (!nextLine) {
+          if (valueLines.length > 0) {
+            break;
+          }
+          continue;
+        }
+        if (/^[^:]{2,80}:\s*(?:\S.*)?$/.test(nextLine)) {
+          break;
+        }
+        valueLines.push(nextLine);
+        if (valueLines.length >= 3 || valueLines.join(" ").length >= 300) {
+          break;
+        }
+      }
+
+      if (valueLines.length > 0) {
+        upsertAssessmentField(
+          metadata,
+          labelOnlyMatch[1],
+          valueLines.join(" "),
+        );
+        i = j - 1;
+      }
+      continue;
+    }
+
+    const inlineMatch = line.match(/^([^:]{2,80}):\s*(.+)$/);
+    if (inlineMatch) {
+      upsertAssessmentField(metadata, inlineMatch[1], inlineMatch[2]);
+    }
+  }
+}
+
+/**
+ * Inserts or updates a single assessment-information entry.
+ * Prefers more descriptive values when the same label is found multiple times.
+ * @param {Map<string, {label: string, value: string}>} metadata - Output map
+ * @param {string} label - Raw field label
+ * @param {string} value - Raw field value
+ */
+function upsertAssessmentField(metadata, label, value) {
+  if (!isLikelyAssessmentFieldLabel(label)) {
+    return;
+  }
+
+  const normalizedLabel = normalizeAssessmentFieldLabel(label);
+  const cleanedValue = cleanAssessmentFieldValue(value);
+
+  if (!normalizedLabel || !cleanedValue) {
+    return;
+  }
+
+  const existing = metadata.get(normalizedLabel);
+  if (
+    !existing ||
+    shouldReplaceAssessmentFieldValue(existing.value, cleanedValue)
+  ) {
+    metadata.set(normalizedLabel, {
+      label: String(label || "").replace(/\s+/g, " ").trim(),
+      value: cleanedValue,
+    });
+  }
+}
+
+/**
+ * Determines whether a label is short and structured enough to be used as a field name.
+ * @param {string} label - Candidate label
+ * @returns {boolean} True when the label looks like a field name
+ */
+function isLikelyAssessmentFieldLabel(label) {
+  const cleaned = String(label || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) {
+    return false;
+  }
+  if (cleaned.length > 80) {
+    return false;
+  }
+  if (cleaned.split(" ").length > 12) {
+    return false;
+  }
+  return /[A-Za-z]/.test(cleaned);
+}
+
+/**
+ * Normalizes a field label for matching.
+ * @param {string} label - Candidate label
+ * @returns {string} Normalized label
+ */
+function normalizeAssessmentFieldLabel(label) {
+  return String(label || "")
+    .replace(/:\s*$/, "")
+    .replace(/&/g, " and ")
+    .replace(/\//g, " ")
+    .replace(/[()]/g, " ")
+    .replace(/[^a-zA-Z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Simplifies a normalized label into a stable token string for fuzzy matching.
+ * @param {string} label - Label or normalized label
+ * @returns {string} Simplified token string
+ */
+function simplifyAssessmentFieldLabel(label) {
+  const replacements = {
+    info: "information",
+    desc: "description",
+    eval: "evaluation",
+    mthd: "method",
+    mthds: "methods",
+  };
+  const stopWords = new Set(["a", "an", "and", "for", "of", "the", "to"]);
+
+  return Array.from(
+    new Set(
+      normalizeAssessmentFieldLabel(label)
+        .split(" ")
+        .map((token) => replacements[token] || token)
+        .filter((token) => token && !stopWords.has(token)),
+    ),
+  )
+    .sort()
+    .join(" ");
+}
+
+/**
+ * Normalizes stored field values.
+ * @param {string} value - Raw field value
+ * @returns {string} Cleaned field value
+ */
+function cleanAssessmentFieldValue(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Picks the more useful value when the same field is seen multiple times.
+ * @param {string} existingValue - Current value
+ * @param {string} nextValue - Newly found value
+ * @returns {boolean} True when the new value should replace the existing one
+ */
+function shouldReplaceAssessmentFieldValue(existingValue, nextValue) {
+  const current = cleanAssessmentFieldValue(existingValue);
+  const candidate = cleanAssessmentFieldValue(nextValue);
+
+  if (!current) {
+    return Boolean(candidate);
+  }
+  if (!candidate) {
+    return false;
+  }
+  if (candidate.length > current.length + 5) {
+    return true;
+  }
+
+  return current.endsWith(":") && !candidate.endsWith(":");
+}
+
+/**
+ * Finds the best matching assessment entry for a sheet row label.
+ * @param {string} sheetLabel - Label from the Assessment Information sheet
+ * @param {Map<string, {label: string, value: string}>} metadata - Extracted entries
+ * @returns {{label: string, value: string}|null} Best matching entry or null
+ */
+function findAssessmentEntryForLabel(sheetLabel, metadata) {
+  const normalizedLabel = normalizeAssessmentFieldLabel(sheetLabel);
+  if (!normalizedLabel) {
+    return null;
+  }
+
+  if (metadata.has(normalizedLabel)) {
+    return metadata.get(normalizedLabel);
+  }
+
+  let bestEntry = null;
+  let bestScore = 0;
+  let secondBestScore = 0;
+
+  for (const [candidateLabel, entry] of metadata.entries()) {
+    const score = scoreAssessmentFieldMatch(
+      normalizedLabel,
+      candidateLabel,
+    );
+
+    if (score > bestScore) {
+      secondBestScore = bestScore;
+      bestScore = score;
+      bestEntry = entry;
+    } else if (score > secondBestScore) {
+      secondBestScore = score;
+    }
+  }
+
+  if (
+    bestScore >= CONFIG.ASSESSMENT_INFO.MIN_FUZZY_MATCH_SCORE &&
+    bestScore - secondBestScore >= 0.1
+  ) {
+    return bestEntry;
+  }
+
+  return null;
+}
+
+/**
+ * Scores how well two assessment field labels match.
+ * @param {string} label - First label
+ * @param {string} candidate - Candidate label
+ * @returns {number} Match score from 0 to 1
+ */
+function scoreAssessmentFieldMatch(label, candidate) {
+  const normalizedLabel = normalizeAssessmentFieldLabel(label);
+  const normalizedCandidate = normalizeAssessmentFieldLabel(candidate);
+
+  if (!normalizedLabel || !normalizedCandidate) {
+    return 0;
+  }
+  if (normalizedLabel === normalizedCandidate) {
+    return 1;
+  }
+
+  const simplifiedLabel = simplifyAssessmentFieldLabel(normalizedLabel);
+  const simplifiedCandidate = simplifyAssessmentFieldLabel(normalizedCandidate);
+
+  if (simplifiedLabel && simplifiedLabel === simplifiedCandidate) {
+    return 0.95;
+  }
+
+  const labelTokens = simplifiedLabel ? simplifiedLabel.split(" ") : [];
+  const candidateTokens = simplifiedCandidate
+    ? simplifiedCandidate.split(" ")
+    : [];
+  const sharedTokenCount = Array.from(
+    new Set(labelTokens.filter((token) => candidateTokens.includes(token))),
+  ).length;
+  const minTokenCount = Math.min(labelTokens.length, candidateTokens.length);
+  const maxTokenCount = Math.max(labelTokens.length, candidateTokens.length);
+
+  if (
+    minTokenCount >= 2 &&
+    (simplifiedLabel.includes(simplifiedCandidate) ||
+      simplifiedCandidate.includes(simplifiedLabel))
+  ) {
+    return 0.85;
+  }
+
+  if (sharedTokenCount >= 2 && maxTokenCount > 0) {
+    const ratio = sharedTokenCount / maxTokenCount;
+    if (ratio >= 0.75) {
+      return 0.8;
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * Checks whether a row label should remain untouched by the assessment step.
+ * @param {string} label - Sheet row label
+ * @returns {boolean} True when the row must be skipped
+ */
+function shouldSkipAssessmentField(label) {
+  const normalizedLabel = normalizeAssessmentFieldLabel(label);
+  return CONFIG.ASSESSMENT_INFO.EXCLUDED_FIELD_NAMES.some(
+    (excludedLabel) =>
+      normalizeAssessmentFieldLabel(excludedLabel) === normalizedLabel,
+  );
+}
+
+/**
+ * Writes extracted assessment information back to the Assessment Information sheet.
+ * Assumes each field label lives in the first populated cell of a row and writes
+ * to the cell immediately to its right.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Assessment sheet
+ * @param {Map<string, {label: string, value: string}>} metadata - Extracted entries
+ * @returns {{totalRows: number, rowsUpdated: number, rowsFailed: number}} Write stats
+ */
+function writeAssessmentInformationToSheet(sheet, metadata) {
+  const values = sheet.getDataRange().getValues();
+  let totalRows = 0;
+  let rowsUpdated = 0;
+
+  for (let r = 0; r < values.length; r++) {
+    const row = values[r];
+    const labelColIndex = row.findIndex(
+      (cellValue) => String(cellValue || "").trim() !== "",
+    );
+
+    if (labelColIndex === -1 || labelColIndex >= row.length - 1) {
+      continue;
+    }
+
+    const rowLabel = String(row[labelColIndex] || "").trim();
+    if (!rowLabel || shouldSkipAssessmentField(rowLabel)) {
+      continue;
+    }
+
+    totalRows++;
+    const match = findAssessmentEntryForLabel(rowLabel, metadata);
+    if (!match) {
+      continue;
+    }
+
+    sheet.getRange(r + 1, labelColIndex + 2).setValue(match.value);
+    rowsUpdated++;
+    Logger.log(
+      `Assessment information matched row ${r + 1}: "${rowLabel}" -> "${match.label}"`,
+    );
+  }
+
+  return {
+    totalRows: totalRows,
+    rowsUpdated: rowsUpdated,
+    rowsFailed: totalRows - rowsUpdated,
+  };
+}
+
+/*******************************************************
  * SHEET VALIDATION AND COLUMN MAPPING
  *******************************************************/
 
@@ -773,12 +1275,11 @@ function normalizeCriteriaKey(text) {
  *******************************************************/
 
 /**
- * Loads document from Drive and extracts tables
- * Handles Google Docs, DOCX, and PDF files (auto-converts as needed)
+ * Loads a Drive document and returns an opened Google Doc for downstream processing.
  * @param {string} fileId - Google Drive file ID
- * @returns {Object} Object containing tables array and optional tempDocId
+ * @returns {Object} Object containing DocumentApp.Document and optional tempDocId
  */
-function loadDocument(fileId) {
+function openDocumentForProcessing(fileId) {
   let tempDocId = null;
 
   try {
@@ -787,7 +1288,6 @@ function loadDocument(fileId) {
 
     let docId = fileId;
 
-    // Handle DOCX conversion
     if (
       mimeType ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -795,9 +1295,7 @@ function loadDocument(fileId) {
       Logger.log(`Converting DOCX to Google Doc: ${file.getName()}`);
       docId = convertDocxToGoogleDoc(file);
       tempDocId = docId;
-    }
-    // Handle PDF conversion (with OCR)
-    else if (mimeType === "application/pdf") {
+    } else if (mimeType === "application/pdf") {
       Logger.log(`Converting PDF to Google Doc (with OCR): ${file.getName()}`);
       docId = convertPdfToGoogleDoc(file);
       tempDocId = docId;
@@ -807,23 +1305,43 @@ function loadDocument(fileId) {
       );
     }
 
-    // Open document and extract tables
-    const doc = DocumentApp.openById(docId);
-    const tables = doc.getBody().getTables();
+    return {
+      doc: DocumentApp.openById(docId),
+      tempDocId: tempDocId,
+    };
+  } catch (error) {
+    if (tempDocId) {
+      cleanupTempDoc(tempDocId);
+    }
+    throw new Error(`Failed to load document: ${error.message}`);
+  }
+}
+
+/**
+ * Loads document from Drive and extracts tables
+ * Handles Google Docs, DOCX, and PDF files (auto-converts as needed)
+ * @param {string} fileId - Google Drive file ID
+ * @returns {Object} Object containing tables array, document, and optional tempDocId
+ */
+function loadDocument(fileId) {
+  try {
+    const documentData = openDocumentForProcessing(fileId);
+    const tables = documentData.doc.getBody().getTables();
 
     if (!tables || tables.length === 0) {
+      cleanup(documentData.tempDocId);
       throw new Error(
         "No tables found in document. Please check document structure.",
       );
     }
 
-    return { tables, tempDocId };
+    return {
+      doc: documentData.doc,
+      tables: tables,
+      tempDocId: documentData.tempDocId,
+    };
   } catch (error) {
-    // Cleanup temp doc if error occurs
-    if (tempDocId) {
-      cleanupTempDoc(tempDocId);
-    }
-    throw new Error(`Failed to load document: ${error.message}`);
+    throw error;
   }
 }
 
