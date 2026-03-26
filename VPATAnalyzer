@@ -421,6 +421,11 @@ function resolveDriveFileIdFromRange(range) {
     }
   }
 
+  const chipUrl = getDriveFileChipUrlFromRange(range);
+  if (chipUrl) {
+    return extractDriveFileId(chipUrl);
+  }
+
   return "";
 }
 
@@ -440,16 +445,26 @@ function extractDriveFileId(value) {
     return text;
   }
 
-  const patterns = [
-    /\/d\/([a-zA-Z0-9_-]{20,})/,
-    /[?&]id=([a-zA-Z0-9_-]{20,})/,
-  ];
+  const urlMatch = text.match(/^https?:\/\/([^/?#]+)(\/[^?#]*)?(\?[^#]*)?/i);
+  if (!urlMatch) {
+    return "";
+  }
 
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match && match[1]) {
-      return match[1];
-    }
+  const host = urlMatch[1] || "";
+  if (!isSupportedGoogleFileUrl(host)) {
+    return "";
+  }
+
+  const path = urlMatch[2] || "";
+  const pathMatch = path.match(/\/d\/([a-zA-Z0-9_-]{20,})/);
+  if (pathMatch && pathMatch[1]) {
+    return pathMatch[1];
+  }
+
+  const query = urlMatch[3] || "";
+  const queryMatch = query.match(/[?&]id=([a-zA-Z0-9_-]{20,})/);
+  if (queryMatch && queryMatch[1]) {
+    return queryMatch[1];
   }
 
   return "";
@@ -462,6 +477,66 @@ function extractDriveFileId(value) {
  */
 function looksLikeDriveFileId(value) {
   return /^[a-zA-Z0-9_-]{20,}$/.test(String(value || "").trim());
+}
+
+/**
+ * Checks whether a host belongs to a supported Google Drive/Docs URL.
+ * @param {string} hostValue - URL host candidate
+ * @returns {boolean} True when the host is a supported Google file URL host
+ */
+function isSupportedGoogleFileUrl(hostValue) {
+  const host = String(hostValue || "").trim().toLowerCase();
+
+  return host === "drive.google.com" || host === "docs.google.com";
+}
+
+/**
+ * Reads chip metadata for a single cell and returns the first Drive-backed chip URL.
+ * Smart chips are exposed through chipRuns in the Sheets API rather than RichTextValue.
+ * @param {GoogleAppsScript.Spreadsheet.Range} range - Cell containing the smart chip
+ * @returns {string} Chip URL or empty string if no Drive chip could be read
+ */
+function getDriveFileChipUrlFromRange(range) {
+  try {
+    const sheet = range.getSheet();
+    const spreadsheetId = sheet.getParent().getId();
+    const sheetName = sheet.getName().replace(/'/g, "''");
+    const rangeA1 = `'${sheetName}'!${range.getA1Notation()}`;
+    const fields =
+      "sheets.data.rowData.values(chipRuns),sheets.data.rowData.values.formattedValue";
+    const url =
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}` +
+      `?ranges=${encodeURIComponent(rangeA1)}` +
+      `&fields=${encodeURIComponent(fields)}`;
+    const response = UrlFetchApp.fetch(url, {
+      headers: {
+        Authorization: `Bearer ${ScriptApp.getOAuthToken()}`,
+      },
+      muteHttpExceptions: true,
+    });
+
+    if (response.getResponseCode() !== 200) {
+      Logger.log(
+        `Failed to read chip metadata for ${rangeA1}: ${response.getResponseCode()}`,
+      );
+      return "";
+    }
+
+    const data = JSON.parse(response.getContentText());
+    const cell = data?.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values?.[0];
+    const chipRuns = cell?.chipRuns || [];
+
+    for (const run of chipRuns) {
+      const chipUrl = run?.chip?.richLinkProperties?.uri;
+      if (chipUrl) {
+        return chipUrl;
+      }
+    }
+  } catch (error) {
+    Logger.log(`Unable to read chip metadata: ${error.message}`);
+  }
+
+  return "";
 }
 
 /*******************************************************
