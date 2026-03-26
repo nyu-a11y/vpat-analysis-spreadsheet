@@ -365,7 +365,7 @@ function getUserInput() {
 
   if (!startSheet) {
     throw new Error(
-      `Sheet "${CONFIG.START_SHEET_NAME}" not found. Please create it with a file ID, full Drive URL, or file chip in cell ${CONFIG.FILE_ID_CELL}.`,
+      `Sheet "${CONFIG.START_SHEET_NAME}" not found. Please create it and put the file ID, Google Drive link, or file chip in cell ${CONFIG.FILE_ID_CELL}.`,
     );
   }
 
@@ -375,7 +375,7 @@ function getUserInput() {
   // Validate file ID
   if (!fileId) {
     throw new Error(
-      `A valid Google Drive file reference accessible to the script was not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter a raw file ID, full Drive URL, or file chip. If a file chip was used, check the Apps Script execution log for chip metadata read errors.`,
+      `We couldn't find a usable Google Drive file in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter the file ID, paste the full Google Drive link, or insert a file chip. If you used a file chip, try adding it again or paste the link instead.`,
     );
   }
 
@@ -2314,7 +2314,7 @@ function getVPATFileIdForAnalysis() {
 
   if (!startSheet) {
     throw new Error(
-      `Sheet "${CONFIG.START_SHEET_NAME}" not found. Please create it with a file ID, full Drive URL, or file chip in cell ${CONFIG.FILE_ID_CELL}.`,
+      `Sheet "${CONFIG.START_SHEET_NAME}" not found. Please create it and put the file ID, Google Drive link, or file chip in cell ${CONFIG.FILE_ID_CELL}.`,
     );
   }
 
@@ -2323,7 +2323,7 @@ function getVPATFileIdForAnalysis() {
 
   if (!fileId) {
     throw new Error(
-      `A valid Google Drive file reference accessible to the script was not found in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter a raw file ID, full Drive URL, or file chip. If a file chip was used, check the Apps Script execution log for chip metadata read errors.`,
+      `We couldn't find a usable Google Drive file in cell ${CONFIG.FILE_ID_CELL} of "${CONFIG.START_SHEET_NAME}". Enter the file ID, paste the full Google Drive link, or insert a file chip. If you used a file chip, try adding it again or paste the link instead.`,
     );
   }
 
