@@ -3,6 +3,17 @@
  *
  * This script extracts VPAT data from Google Docs/DOCX files
  * and populates a Google Sheet with conformance levels and remarks.
+ *
+ * GOOGLE SERVICES / API DEPENDENCIES
+ * - Required: Advanced Drive service enabled in Apps Script and the linked
+ *   Google Cloud project. Used for DOCX/PDF conversion, temp-doc cleanup,
+ *   and fallback runner profile lookup.
+ * - Recommended: Advanced People service enabled in Apps Script and the
+ *   linked Google Cloud project. Used as the primary source for the current
+ *   runner's Name and Email in "2) Assessment Information".
+ * - Conditional: Google Sheets API enabled in the linked Google Cloud
+ *   project if you want Start!A3 to support Google Drive file chips. Raw
+ *   file IDs and full Drive links still work without the chip metadata call.
  *******************************************************/
 
 /*******************************************************
@@ -626,6 +637,8 @@ function isSupportedGoogleFileUrl(hostValue) {
 /**
  * Reads chip metadata for a single cell and returns the first Drive-backed chip URL.
  * Smart chips are exposed through chipRuns in the Sheets API rather than RichTextValue.
+ * This REST call depends on the Google Sheets API being enabled in the linked
+ * Google Cloud project when users rely on file chips in Start!A3.
  * @param {GoogleAppsScript.Spreadsheet.Range} range - Cell containing the smart chip
  * @returns {string} Chip URL or empty string if no Drive chip could be read
  */
@@ -721,18 +734,14 @@ function processAssessmentInformation(fileIdOverride) {
       body.getText(),
       body.getTables(),
     );
-
-    if (metadata.size === 0) {
-      SpreadsheetApp.getActiveSpreadsheet().toast(
-        "No assessment information fields were found in the VPAT document.",
-        "Nothing Processed",
-        10,
-      );
-      return { success: false, reason: "no-metadata" };
-    }
+    const runtimeMetadata = getAssessmentRuntimeMetadata();
 
     showProgress("Writing assessment information to sheet...");
-    const results = writeAssessmentInformationToSheet(sheet, metadata);
+    const results = writeAssessmentInformationToSheet(
+      sheet,
+      metadata,
+      runtimeMetadata,
+    );
 
     if (results.rowsUpdated === 0) {
       SpreadsheetApp.getActiveSpreadsheet().toast(
@@ -779,11 +788,240 @@ function extractAssessmentFields(documentText, tables) {
 
   collectAssessmentFieldsFromTables(metadata, tables || []);
   collectAssessmentFieldsFromText(metadata, documentText || "");
+  collectAssessmentFieldsFromDocumentHeuristics(
+    metadata,
+    documentText || "",
+  );
 
   Logger.log(
     `Extracted ${metadata.size} assessment-information fields from the document.`,
   );
   return metadata;
+}
+
+/**
+ * Adds document-wide heuristic metadata for common VPAT cover fields.
+ * This is intentionally not page-bound because some VPATs place prefatory
+ * content before the metadata block or spread it across later pages.
+ * @param {Map<string, {label: string, value: string}>} metadata - Output map
+ * @param {string} documentText - Full document text
+ */
+function collectAssessmentFieldsFromDocumentHeuristics(metadata, documentText) {
+  const lines = getAssessmentDocumentLines(documentText);
+
+  const title = findAssessmentDocumentTitle(lines);
+  if (title) {
+    upsertAssessmentField(metadata, "Document Title (VPAT Title)", title);
+  }
+
+  const vpatVersion = findAssessmentVpatVersion(documentText);
+  if (vpatVersion) {
+    upsertAssessmentField(metadata, "VPAT Version", vpatVersion);
+  }
+
+  const reportDate = findAssessmentValueByLabels(lines, [
+    "report date",
+    "date of report",
+    "publication date",
+    "published date",
+    "revision date",
+    "updated date",
+    "last updated",
+    "date",
+  ]);
+  if (reportDate) {
+    upsertAssessmentField(metadata, "Date", reportDate);
+  }
+
+  const author = findAssessmentValueByLabels(lines, [
+    "author",
+    "prepared by",
+    "prepared by contact",
+    "prepared by organization",
+    "prepared by company",
+  ]);
+  if (author) {
+    upsertAssessmentField(metadata, "Author", author);
+  }
+}
+
+/**
+ * Splits the document into cleaned, non-empty lines for metadata scanning.
+ * @param {string} documentText - Full document text
+ * @returns {string[]} Cleaned document lines
+ */
+function getAssessmentDocumentLines(documentText) {
+  return String(documentText || "")
+    .replace(/\uFEFF/g, "")
+    .split(/\r?\n/)
+    .map((line) => cleanAssessmentFieldValue(line))
+    .filter((line) => line);
+}
+
+/**
+ * Finds a likely VPAT/ACR report title anywhere in the document.
+ * Prefers heading-like lines over field labels and table headers.
+ * @param {string[]} lines - Cleaned document lines
+ * @returns {string} Best title candidate or empty string
+ */
+function findAssessmentDocumentTitle(lines) {
+  let bestCandidate = "";
+  let bestScore = 0;
+
+  for (const line of lines) {
+    if (!line || line.length < 8 || line.length > 180) {
+      continue;
+    }
+    if (line.includes(":")) {
+      continue;
+    }
+    if (
+      /^page\s+\d+(\s+of\s+\d+)?$/i.test(line) ||
+      /^[\d\s._-]+$/.test(line) ||
+      /^_{3,}$/.test(line)
+    ) {
+      continue;
+    }
+
+    let score = 0;
+    if (/accessibility conformance report/i.test(line)) {
+      score += 10;
+    }
+    if (/conformance report/i.test(line)) {
+      score += 6;
+    }
+    if (/accessibility report/i.test(line)) {
+      score += 5;
+    }
+    if (/vpat/i.test(line)) {
+      score += 4;
+    }
+    if (/report/i.test(line)) {
+      score += 2;
+    }
+    if (
+      /criteria|remarks|conformance level|applicable standards|terms|notes|legal disclaimer|standard\/guideline/i.test(
+        line,
+      )
+    ) {
+      score -= 6;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestCandidate = line;
+    }
+  }
+
+  return bestScore >= 4 ? bestCandidate : "";
+}
+
+/**
+ * Extracts the VPAT version from any textual mention in the document.
+ * @param {string} documentText - Full document text
+ * @returns {string} VPAT version or empty string
+ */
+function findAssessmentVpatVersion(documentText) {
+  const text = String(documentText || "").replace(/\uFEFF/g, " ");
+  const patterns = [
+    /based\s+on\s+vpat(?:®)?\s+version\s+([0-9]+(?:\.[0-9]+)+)/i,
+    /vpat(?:®)?\s+version\s+([0-9]+(?:\.[0-9]+)+)/i,
+    /vpat(?:®)?\s*v(?:ersion)?\.?\s*([0-9]+(?:\.[0-9]+)+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      return cleanAssessmentFieldValue(match[1]);
+    }
+  }
+
+  return "";
+}
+
+/**
+ * Finds a field value by scanning the entire document for one of several labels.
+ * Supports inline `Label: Value` rows and label-only rows whose value follows.
+ * @param {string[]} lines - Cleaned document lines
+ * @param {string[]} labels - Candidate labels in preferred order
+ * @returns {string} Matching value or empty string
+ */
+function findAssessmentValueByLabels(lines, labels) {
+  const cleanedLines = Array.isArray(lines) ? lines : [];
+
+  for (const label of labels) {
+    const escapedLabel = escapeRegExp(String(label || "").trim());
+    const inlinePattern = new RegExp(
+      `^${escapedLabel}\\s*[:\\-–]\\s*(.+)$`,
+      "i",
+    );
+    const labelOnlyPattern = new RegExp(`^${escapedLabel}\\s*[:\\-–]?\\s*$`, "i");
+
+    for (let i = 0; i < cleanedLines.length; i++) {
+      const line = cleanedLines[i];
+      if (!line) {
+        continue;
+      }
+
+      const inlineMatch = line.match(inlinePattern);
+      if (inlineMatch && inlineMatch[1]) {
+        return cleanAssessmentFieldValue(inlineMatch[1]);
+      }
+
+      if (!labelOnlyPattern.test(line)) {
+        continue;
+      }
+
+      const nextValue = collectAssessmentValueLines(cleanedLines, i + 1);
+      if (nextValue) {
+        return nextValue;
+      }
+    }
+  }
+
+  return "";
+}
+
+/**
+ * Collects following lines until another field label is encountered.
+ * @param {string[]} lines - Cleaned document lines
+ * @param {number} startIndex - Starting index
+ * @returns {string} Joined value lines
+ */
+function collectAssessmentValueLines(lines, startIndex) {
+  const valueLines = [];
+
+  for (let i = startIndex; i < lines.length; i++) {
+    const nextLine = cleanAssessmentFieldValue(lines[i]);
+    if (!nextLine) {
+      if (valueLines.length > 0) {
+        break;
+      }
+      continue;
+    }
+    if (
+      /^[^:]{2,80}\s*[:\-–]\s*(?:\S.*)?$/i.test(nextLine) ||
+      /^page\s+\d+(\s+of\s+\d+)?$/i.test(nextLine)
+    ) {
+      break;
+    }
+
+    valueLines.push(nextLine);
+    if (valueLines.length >= 2 || valueLines.join(" ").length >= 300) {
+      break;
+    }
+  }
+
+  return cleanAssessmentFieldValue(valueLines.join(" "));
+}
+
+/**
+ * Escapes a string for use in a RegExp constructor.
+ * @param {string} value - Raw text
+ * @returns {string} Escaped text
+ */
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
@@ -1072,9 +1310,16 @@ function scoreAssessmentFieldMatch(label, candidate) {
 
   const simplifiedLabel = simplifyAssessmentFieldLabel(normalizedLabel);
   const simplifiedCandidate = simplifyAssessmentFieldLabel(normalizedCandidate);
+  const canonicalLabel = getAssessmentFieldCanonicalKey(simplifiedLabel);
+  const canonicalCandidate = getAssessmentFieldCanonicalKey(
+    simplifiedCandidate,
+  );
 
   if (simplifiedLabel && simplifiedLabel === simplifiedCandidate) {
     return 0.95;
+  }
+  if (canonicalLabel && canonicalLabel === canonicalCandidate) {
+    return 0.93;
   }
 
   const labelTokens = simplifiedLabel ? simplifiedLabel.split(" ") : [];
@@ -1106,6 +1351,54 @@ function scoreAssessmentFieldMatch(label, candidate) {
 }
 
 /**
+ * Maps common assessment field labels and synonyms to a stable key.
+ * @param {string} label - Simplified or raw label
+ * @returns {string} Canonical key or empty string
+ */
+function getAssessmentFieldCanonicalKey(label) {
+  const normalizedLabel = normalizeAssessmentFieldLabel(label);
+  const simplifiedLabel = simplifyAssessmentFieldLabel(normalizedLabel);
+  const tokens = simplifiedLabel ? simplifiedLabel.split(" ") : [];
+  const tokenSet = new Set(tokens);
+
+  if (
+    tokenSet.has("title") &&
+    (tokenSet.has("document") ||
+      tokenSet.has("vpat") ||
+      tokenSet.has("report"))
+  ) {
+    return "document_title";
+  }
+
+  if (
+    tokenSet.has("version") &&
+    (tokenSet.has("vpat") || normalizedLabel.includes("based on vpat"))
+  ) {
+    return "vpat_version";
+  }
+
+  if (
+    tokenSet.has("author") ||
+    (tokenSet.has("prepared") && tokenSet.has("by"))
+  ) {
+    return "author";
+  }
+
+  if (tokenSet.has("date")) {
+    return "date";
+  }
+
+  if (
+    tokenSet.has("contact") &&
+    (tokenSet.has("information") || tokenSet.has("info"))
+  ) {
+    return "contact_information";
+  }
+
+  return "";
+}
+
+/**
  * Checks whether a row label should remain untouched by the assessment step.
  * @param {string} label - Sheet row label
  * @returns {boolean} True when the row must be skipped
@@ -1119,14 +1412,337 @@ function shouldSkipAssessmentField(label) {
 }
 
 /**
- * Writes extracted assessment information back to the Assessment Information sheet.
+ * Builds the runtime-sourced assessment entries.
+ * Name and Email come from the current runner profile. The script uses the
+ * People API first, then falls back to Drive/Session data if People is not
+ * enabled or the extra scope has not been granted. Date of Evaluation is the
+ * current timestamp in the spreadsheet's timezone.
+ * @returns {Map<string, {label: string, value: *}>} Normalized label -> entry
+ */
+function getAssessmentRuntimeMetadata() {
+  const runtimeMetadata = new Map();
+  const userProfile = getCurrentAssessmentUserProfile();
+
+  upsertAssessmentRuntimeField(
+    runtimeMetadata,
+    "Name",
+    userProfile.name,
+    userProfile.nameSource,
+  );
+  upsertAssessmentRuntimeField(
+    runtimeMetadata,
+    "Email",
+    userProfile.email,
+    userProfile.emailSource,
+  );
+  upsertAssessmentRuntimeField(
+    runtimeMetadata,
+    "Date of Evaluation",
+    new Date(),
+    "runtime_timestamp",
+  );
+
+  Logger.log(
+    `[Assessment Information] Prepared ${runtimeMetadata.size} runtime assessment-information fields.`,
+  );
+  return runtimeMetadata;
+}
+
+/**
+ * Checks whether a sheet row is sourced from runtime data rather than the VPAT.
+ * @param {string} label - Sheet row label
+ * @returns {boolean} True when the row should only use runtime data
+ */
+function isRuntimeAssessmentFieldLabel(label) {
+  const normalizedLabel = normalizeAssessmentFieldLabel(label);
+  const runtimeLabels = [
+    "name",
+    "email",
+    "date of evaluation",
+  ];
+
+  return runtimeLabels.includes(normalizedLabel);
+}
+
+/**
+ * Reads the current user's display name and email.
+ * Uses the People API first when available, then falls back to the Drive
+ * profile and Session emails if the advanced service or scopes are unavailable.
+ * @returns {{name: string, email: string}} Current user profile
+ */
+function getCurrentAssessmentUserProfile() {
+  const peopleProfile = getCurrentAssessmentUserProfileFromPeopleApi();
+  const fallbackProfile = getCurrentAssessmentUserProfileFromDrive();
+  const resolvedEmail = peopleProfile.email || fallbackProfile.email;
+  const derivedName = deriveAssessmentNameFromEmail(resolvedEmail);
+  const resolvedName =
+    peopleProfile.name || fallbackProfile.name || derivedName;
+  const nameSource = peopleProfile.name
+    ? peopleProfile.nameSource
+    : fallbackProfile.name
+      ? fallbackProfile.nameSource
+      : derivedName
+        ? "email_local_part"
+        : "";
+  const emailSource = peopleProfile.email
+    ? peopleProfile.emailSource
+    : fallbackProfile.emailSource;
+
+  Logger.log(
+    `[Assessment Information] Resolved runner profile: ` +
+      `nameSource=${nameSource || "none"}, ` +
+      `emailSource=${emailSource || "none"}, ` +
+      `namePresent=${Boolean(resolvedName)}, ` +
+      `emailPresent=${Boolean(resolvedEmail)}`,
+  );
+
+  if (!resolvedName) {
+    Logger.log(
+      "[Assessment Information] Runner name could not be resolved from People, Drive, or email fallback.",
+    );
+  }
+
+  return {
+    name: resolvedName,
+    email: resolvedEmail,
+    nameSource: nameSource,
+    emailSource: emailSource,
+  };
+}
+
+/**
+ * Reads the current user's profile from the Apps Script advanced People service.
+ * Requires the People API advanced service plus
+ * https://www.googleapis.com/auth/userinfo.profile and
+ * https://www.googleapis.com/auth/userinfo.email for the returned user fields.
+ * If this dependency is not available, the caller falls back to Drive and
+ * Session data.
+ * @returns {{name: string, email: string}} Current user profile or blanks
+ */
+function getCurrentAssessmentUserProfileFromPeopleApi() {
+  try {
+    const people = People.People.getBatchGet({
+      resourceNames: ["people/me"],
+      personFields: "names,emailAddresses",
+    });
+    const personResponse =
+      people && people.responses && people.responses.length > 0
+        ? people.responses[0]
+        : null;
+    const person = personResponse && personResponse.person
+      ? personResponse.person
+      : null;
+
+    const resolvedName = getPrimaryPeopleFieldValue(
+      person && person.names,
+      "displayName",
+    );
+    const resolvedEmail = getPrimaryPeopleFieldValue(
+      person && person.emailAddresses,
+      "value",
+    );
+
+    if (!resolvedName && !resolvedEmail) {
+      Logger.log(
+        "[Assessment Information] People API returned no profile fields for people/me. " +
+          "Check that the Advanced People service is enabled and that the script has " +
+          "userinfo.profile and userinfo.email scopes granted.",
+      );
+    }
+
+    return {
+      name: resolvedName,
+      email: resolvedEmail,
+      nameSource: resolvedName ? "people_api" : "",
+      emailSource: resolvedEmail ? "people_api" : "",
+    };
+  } catch (error) {
+    Logger.log(`Unable to read current People user profile: ${error.message}`);
+
+    return {
+      name: "",
+      email: "",
+      nameSource: "",
+      emailSource: "",
+    };
+  }
+}
+
+/**
+ * Reads the current user's profile from the Drive profile as a fallback.
+ * This depends on the Advanced Drive service, which is already required by
+ * DOCX/PDF conversion elsewhere in this script.
+ * @returns {{name: string, email: string}} Current user profile or blanks
+ */
+function getCurrentAssessmentUserProfileFromDrive() {
+  try {
+    const about = Drive.About.get({
+      fields: "user(displayName,emailAddress)",
+    });
+    const user = about && about.user ? about.user : null;
+    const driveName = cleanAssessmentFieldValue(user && user.displayName);
+    const driveEmail = cleanAssessmentFieldValue(
+      user && (user.emailAddress || user.email),
+    );
+    const sessionEmail = cleanAssessmentFieldValue(
+      Session.getActiveUser().getEmail() ||
+        Session.getEffectiveUser().getEmail(),
+    );
+
+    return {
+      name: driveName,
+      email: driveEmail || sessionEmail,
+      nameSource: driveName ? "drive_profile" : "",
+      emailSource: driveEmail ? "drive_profile" : sessionEmail ? "session" : "",
+    };
+  } catch (error) {
+    Logger.log(`Unable to read current Drive user profile: ${error.message}`);
+    const sessionEmail = cleanAssessmentFieldValue(
+      Session.getActiveUser().getEmail() ||
+        Session.getEffectiveUser().getEmail(),
+    );
+
+    return {
+      name: "",
+      email: sessionEmail,
+      nameSource: "",
+      emailSource: sessionEmail ? "session" : "",
+    };
+  }
+}
+
+/**
+ * Derives a readable fallback name from an email address when profile APIs do
+ * not provide a display name.
+ * @param {string} email - Candidate email address
+ * @returns {string} Fallback display name or empty string
+ */
+function deriveAssessmentNameFromEmail(email) {
+  const cleanedEmail = cleanAssessmentFieldValue(email);
+  if (!cleanedEmail || cleanedEmail.indexOf("@") === -1) {
+    return "";
+  }
+
+  const localPart = cleanedEmail.split("@")[0].split("+")[0];
+  if (!localPart) {
+    return "";
+  }
+
+  const hasWordSeparators = /[._-]/.test(localPart);
+  if (!hasWordSeparators && /\d/.test(localPart)) {
+    return localPart;
+  }
+
+  const normalizedLocalPart = localPart
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalizedLocalPart) {
+    return localPart;
+  }
+
+  return normalizedLocalPart
+    .split(" ")
+    .map((token) => formatAssessmentNameToken(token))
+    .join(" ");
+}
+
+/**
+ * Normalizes one token in an email-derived fallback name.
+ * @param {string} token - Candidate token
+ * @returns {string} Formatted token
+ */
+function formatAssessmentNameToken(token) {
+  const cleanedToken = String(token || "").trim();
+  if (!cleanedToken) {
+    return "";
+  }
+  if (!/[A-Za-z]/.test(cleanedToken)) {
+    return cleanedToken;
+  }
+
+  return cleanedToken.charAt(0).toUpperCase() + cleanedToken.slice(1);
+}
+
+/**
+ * Extracts the primary value from a People API field array.
+ * @param {Array<Object>|undefined} fields - People API field array
+ * @param {string} valueKey - Property to read from the selected item
+ * @returns {string} Cleaned field value
+ */
+function getPrimaryPeopleFieldValue(fields, valueKey) {
+  if (!Array.isArray(fields) || fields.length === 0) {
+    return "";
+  }
+
+  const primaryField =
+    fields.find(
+      (field) => field && field.metadata && field.metadata.primary,
+    ) || fields[0];
+
+  return cleanAssessmentFieldValue(
+    primaryField && primaryField[valueKey],
+  );
+}
+
+/**
+ * Inserts a runtime-provided assessment entry without forcing values to strings.
+ * @param {Map<string, {label: string, value: *}>} metadata - Output map
+ * @param {string} label - Raw field label
+ * @param {*} value - Runtime-derived field value
+ */
+function upsertAssessmentRuntimeField(metadata, label, value, source) {
+  const normalizedLabel = normalizeAssessmentFieldLabel(label);
+  if (!normalizedLabel) {
+    return;
+  }
+
+  const hasDateValue =
+    Object.prototype.toString.call(value) === "[object Date]" &&
+    !isNaN(value.getTime());
+  const cleanedValue = hasDateValue ? value : cleanAssessmentFieldValue(value);
+
+  if (!hasDateValue && !cleanedValue) {
+    return;
+  }
+
+  metadata.set(normalizedLabel, {
+    label: String(label || "").replace(/\s+/g, " ").trim(),
+    value: cleanedValue,
+    source: String(source || "").trim(),
+  });
+}
+
+/**
+ * Writes one assessment value into the sheet and applies timestamp formatting
+ * when the value is a Date object.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Assessment sheet
+ * @param {number} rowNumber - 1-based row number
+ * @param {number} columnNumber - 1-based column number
+ * @param {*} value - Value to write
+ */
+function writeAssessmentSheetValue(sheet, rowNumber, columnNumber, value) {
+  const range = sheet.getRange(rowNumber, columnNumber);
+  range.setValue(value);
+
+  if (
+    Object.prototype.toString.call(value) === "[object Date]" &&
+    !isNaN(value.getTime())
+  ) {
+    range.setNumberFormat("yyyy-mm-dd hh:mm:ss");
+  }
+}
+
+/**
+ * Writes extracted and runtime assessment information back to the sheet.
  * Assumes each field label lives in the first populated cell of a row and writes
  * to the cell immediately to its right.
  * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Assessment sheet
- * @param {Map<string, {label: string, value: string}>} metadata - Extracted entries
+ * @param {Map<string, {label: string, value: string}>} metadata - VPAT-extracted entries
+ * @param {Map<string, {label: string, value: *}>} runtimeMetadata - Runtime-derived entries
  * @returns {{totalRows: number, rowsUpdated: number, rowsFailed: number}} Write stats
  */
-function writeAssessmentInformationToSheet(sheet, metadata) {
+function writeAssessmentInformationToSheet(sheet, metadata, runtimeMetadata) {
   const values = sheet.getDataRange().getValues();
   let totalRows = 0;
   let rowsUpdated = 0;
@@ -1147,12 +1763,40 @@ function writeAssessmentInformationToSheet(sheet, metadata) {
     }
 
     totalRows++;
+    const normalizedRowLabel = normalizeAssessmentFieldLabel(rowLabel);
+    const runtimeMatch =
+      normalizedRowLabel && runtimeMetadata
+        ? runtimeMetadata.get(normalizedRowLabel)
+        : null;
+
+    if (runtimeMatch) {
+      writeAssessmentSheetValue(
+        sheet,
+        r + 1,
+        labelColIndex + 2,
+        runtimeMatch.value,
+      );
+      rowsUpdated++;
+      Logger.log(
+        `Assessment information matched row ${r + 1}: "${rowLabel}" -> runtime "${runtimeMatch.label}"` +
+          (runtimeMatch.source ? ` [source=${runtimeMatch.source}]` : ""),
+      );
+      continue;
+    }
+
+    if (isRuntimeAssessmentFieldLabel(rowLabel)) {
+      Logger.log(
+        `[Assessment Information] Row ${r + 1} "${rowLabel}" is runtime-only, but no runtime value was resolved.`,
+      );
+      continue;
+    }
+
     const match = findAssessmentEntryForLabel(rowLabel, metadata);
     if (!match) {
       continue;
     }
 
-    sheet.getRange(r + 1, labelColIndex + 2).setValue(match.value);
+    writeAssessmentSheetValue(sheet, r + 1, labelColIndex + 2, match.value);
     rowsUpdated++;
     Logger.log(
       `Assessment information matched row ${r + 1}: "${rowLabel}" -> "${match.label}"`,
